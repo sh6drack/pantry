@@ -210,6 +210,6 @@ def index():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'web':
-        app.run(debug=True)
+        app.run(debug=True, host='0.0.0.0', port=8080)
     else:
         run_cli()
