@@ -1,215 +1,207 @@
 import requests
 import json
-from flask import Flask, render_template_string, request as flask_request
+import time
+import os
+from functools import lru_cache
+from flask import Flask
 
-api_key = "5897e80cbbc34d10a19363b0962cafcf"
+# Configuration
+API_KEY = "5897e80cbbc34d10a19363b0962cafcf"
+MAX_DAILY_REQUESTS = 140  # Leave buffer of 10 from 150 limit
+REQUEST_COUNT_FILE = "api_usage.txt"
 
+class QuotaManager:
+    def __init__(self):
+        self.request_count = self.load_today_count()
+    
+    def load_today_count(self):
+        """Load today's request count from file"""
+        today = time.strftime('%Y-%m-%d')
+        try:
+            with open(REQUEST_COUNT_FILE, 'r') as f:
+                lines = f.readlines()
+                # Count requests from today
+                return sum(1 for line in lines if line.startswith(today))
+        except FileNotFoundError:
+            return 0
+    
+    def log_request(self):
+        """Log a new API request"""
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        with open(REQUEST_COUNT_FILE, 'a') as f:
+            f.write(f"{timestamp}\n")
+        self.request_count += 1
+    
+    def can_make_request(self):
+        """Check if we can make another request"""
+        return self.request_count < MAX_DAILY_REQUESTS
+    
+    def get_remaining_requests(self):
+        """Get remaining requests for today"""
+        return max(0, MAX_DAILY_REQUESTS - self.request_count)
 
-def get_user_input():
-    ingredients = input("Seperated by commas, enter your available ingredients: ")
-    ingredient_list = ingredients.split(", ")
+quota_manager = QuotaManager()
 
-    return ingredient_list
-
-def get_user_filters():
-    filters = input(
-        "gluten-free, ketogenic, vegetarian, lacto-vegetarian, ovo-vegetarian, \
-vegan, pescetarian, paleo, lowFODMAP, whole30 ; Seperated by commas, enter your \
-desired dietary filters(If none, leave blank): ")
-    filter_list = filters.split(", ")
-
-    return filter_list
-
-def make_ingredient_api_call(ingredients, filters = []): 
-    #ingredients argument requieed by findbyingredient spoonacular endpoint
-    #filters optional & serves as optional additional criteria, []
+@lru_cache(maxsize=50)
+def cached_ingredient_search(ingredients_str, max_recipes=3):
+    """Cache ingredient searches to avoid duplicate API calls"""
+    if not quota_manager.can_make_request():
+        return None
+    
     url = "https://api.spoonacular.com/recipes/findByIngredients"
-    if not isinstance(ingredients, list):
-        raise TypeError("ingredients must be in a list")
+    params = {
+        "apiKey": API_KEY,
+        "ingredients": ingredients_str,
+        "number": max_recipes,
+        "ranking": 2,  # Maximize used ingredients
+        "ignorePantry": True
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        quota_manager.log_request()
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        return None
+
+def get_bulk_recipe_details(recipe_ids):
+    """Get multiple recipe details in one API call instead of individual calls"""
+    if not quota_manager.can_make_request():
+        return None
+    
+    if not recipe_ids:
+        return None
+    
+    # Use bulk endpoint - much more efficient
+    ids_str = ",".join(map(str, recipe_ids))
+    url = "https://api.spoonacular.com/recipes/informationBulk"
     
     params = {
-        "apiKey": api_key,
-        "ingredients": ",".join(ingredients),
-        #"number" : 5
-        "diet" : ",".join(filters) if filters else None
+        "apiKey": API_KEY,
+        "ids": ids_str,
+        "includeNutrition": False  # Skip nutrition to save on response size
     }
+    
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        quota_manager.log_request()
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"Bulk API request failed: {e}")
+        return None
 
-    response = requests.get(url, params = params)
-    return response
+def get_user_input():
+    """CLI input for ingredients"""
+    ingredients = input("Enter your available ingredients (comma-separated): ")
+    return [i.strip() for i in ingredients.split(",") if i.strip()]
 
-def make_recipe_info_api_call(recipe_id):
-    url = f"https://api.spoonacular.com/recipes/{recipe_id}/information?includeNutrition=true"
-    params = {
-        "apiKey": api_key
-    }
+def get_user_filters():
+    """CLI input for dietary filters"""
+    print("Available filters: gluten-free, ketogenic, vegetarian, vegan, pescetarian, paleo")
+    filters = input("Enter dietary filters (comma-separated, or leave blank): ")
+    return [f.strip() for f in filters.split(",") if f.strip()]
 
-    response = requests.get(url, params = params)
-    return response
-
-
-def process_response(response):
-    if response.status_code == 200:
-        data = response.json()
-
-        title = data.get("title", "no title found")
-        image_url = data.get("image", "")
-        summary = data.get("summary", "")
-        ingredients = data.get("extendedIngredients", [])
-        nutrition = data.get("nutrition", {}).get("nutrients", []) 
-        #nutrition is a dictionary
-
-        print(f"\nTitle: {title}")
-        # print(f"Image: {image_url}")
-        print(f"\nSummary: {summary}")
-        print("Ingredients:")
-        for ingredient in ingredients:
-            name = ingredient.get("name", "unkown")
-            amount = ingredient.get("amount", "n/a")
-            unit = ingredient.get("unit", "")
-            print(f"- {name}: {amount} {unit}")
-
-        nutrition = data.get("nutrition", {})  
-        # nutrition holds nested structure
-        nutrients = nutrition.get("nutrients", []) 
-        # nutrition has key "nutrients" --
-        # nutrients is a list of small dictionaries with keys name amount unit
-        # so, "for each _ in nutrients" -
-        if nutrients:
-            print("\nNutritional Information:")
-            for nutrient in nutrients:
-                name = nutrient.get("name", "")
-                amount = nutrient.get("amount", "NA")
-                unit = nutrient.get("unit", "")
-                if amount != 0:
-                    print(f"- {name}: {amount} {unit}")
-        else:
-            print("\nNo nutritional information available")
+def search_recipes_efficiently(ingredients, max_recipes=3):
+    """Efficient recipe search using only 2 API calls maximum"""
+    if not ingredients:
+        return []
+    
+    # Check quota first
+    if not quota_manager.can_make_request():
+        print(f"⚠️ Daily quota exceeded ({quota_manager.request_count}/{MAX_DAILY_REQUESTS})")
+        return []
+    
+    print(f"API requests remaining: {quota_manager.get_remaining_requests()}")
+    
+    # Step 1: Find recipes by ingredients (1 API call)
+    ingredients_str = ",".join(ingredients)
+    response = cached_ingredient_search(ingredients_str, max_recipes)
+    
+    if not response or response.status_code != 200:
+        print(f"Failed to find recipes. Status: {response.status_code if response else 'No response'}")
+        return []
+    
+    basic_recipes = response.json()
+    if not basic_recipes:
+        print("No recipes found with those ingredients.")
+        return []
+    
+    # Step 2: Get detailed info for all recipes (1 more API call)
+    recipe_ids = [recipe["id"] for recipe in basic_recipes]
+    details_response = get_bulk_recipe_details(recipe_ids)
+    
+    if details_response and details_response.status_code == 200:
+        detailed_recipes = details_response.json()
+        print(f"Found {len(detailed_recipes)} recipes using {quota_manager.request_count} API calls")
+        return detailed_recipes
     else:
-        print(f"Error: {response.status_code}")
-        return None 
+        # Fallback to basic info if bulk fails
+        print("Using basic recipe info (bulk details failed)")
+        return basic_recipes
+
+def display_recipe(recipe):
+    """Display a single recipe in CLI"""
+    title = recipe.get("title", "No title")
+    summary = recipe.get("summary", "No description available")
+    
+    # Handle both detailed and basic recipe formats
+    if "extendedIngredients" in recipe:
+        # Detailed format
+        ingredients = recipe.get("extendedIngredients", [])
+        ingredient_list = [
+            f"- {ing.get('name', 'unknown')}: {ing.get('amount', '')} {ing.get('unit', '')}"
+            for ing in ingredients[:8]  # Limit to first 8 ingredients
+        ]
+    else:
+        # Basic format from findByIngredients
+        ingredient_list = ["- Check recipe for full ingredient list"]
+    
+    print(f"\n{'='*50}")
+    print(f"🍽️  {title}")
+    print(f"{'='*50}")
+    print(f"Summary: {summary[:200]}...")
+    print("\nIngredients:")
+    for ingredient in ingredient_list:
+        print(ingredient)
 
 def run_cli():
+    """Efficient CLI version"""
+    print("🍽️  Efficient Meal Planner")
+    print(f"API requests remaining today: {quota_manager.get_remaining_requests()}")
+    
+    if not quota_manager.can_make_request():
+        print("❌ Daily API quota exceeded. Try again tomorrow!")
+        return
+    
     ingredients = get_user_input()
-    filters = get_user_filters() 
-    recipe_data_response = make_ingredient_api_call(ingredients, filters)
-
-    if recipe_data_response.status_code == 200:
-        recipe_data = recipe_data_response.json()
-
-        if recipe_data:
-            for recipe in recipe_data:
-                recipe_id = recipe["id"]
-                recipe_info_response = make_recipe_info_api_call(recipe_id)
-                process_response(recipe_info_response)
-                print("\n\n---\n\n")
-        else: 
-            print("No recipes found.")
+    if not ingredients:
+        print("No ingredients provided!")
+        return
+    
+    # Get recipes efficiently
+    recipes = search_recipes_efficiently(ingredients, max_recipes=3)
+    
+    if recipes:
+        print(f"\n✅ Found {len(recipes)} recipes!")
+        for recipe in recipes:
+            display_recipe(recipe)
     else:
-        print(f"Error: {recipe_data_response.status_code}")
+        print("❌ No recipes found.")
+    
+    print(f"\n📊 API calls used: {quota_manager.request_count}/{MAX_DAILY_REQUESTS}")
 
-# Minimal Flask app
+# Flask Web App
 app = Flask(__name__)
 
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Meal Planner</title>
-    <style>
-        body {
-            background: #f5f5dc;
-            min-height: 100vh;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .center-box {
-            background: white;
-            padding: 2rem 2.5rem;
-            border-radius: 12px;
-            box-shadow: 0 2px 12px rgba(0,0,0,0.07);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        input[type="text"] {
-            width: 300px;
-            padding: 0.5rem;
-            font-size: 1rem;
-            border-radius: 6px;
-            border: 1px solid #ccc;
-            margin-bottom: 1rem;
-        }
-        button {
-            background: #f5f5dc;
-            border: none;
-            padding: 0.5rem 1.5rem;
-            border-radius: 6px;
-            font-size: 1rem;
-            cursor: pointer;
-        }
-        .results {
-            margin-top: 2rem;
-            text-align: left;
-        }
-    </style>
-</head>
-<body>
-    <form method="POST">
-        <div class="center-box">
-            <h2>Enter your ingredients</h2>
-            <input type="text" name="ingredients" placeholder="e.g. tomato, cheese, bread" required>
-            <button type="submit">Find Recipes</button>
-            {% if results %}
-            <div class="results">
-                {{ results|safe }}
-            </div>
-            {% endif %}
-        </div>
-    </form>
-</body>
-</html>
-'''
-
-def get_recipes_html(ingredients):
-    # No filters for now, just ingredients
-    response = make_ingredient_api_call(ingredients)
-    if response.status_code == 200:
-        recipe_data = response.json()
-        if recipe_data:
-            html = ""
-            for recipe in recipe_data:
-                recipe_id = recipe["id"]
-                recipe_info_response = make_recipe_info_api_call(recipe_id)
-                if recipe_info_response.status_code == 200:
-                    data = recipe_info_response.json()
-                    title = data.get("title", "no title found")
-                    image_url = data.get("image", "")
-                    summary = data.get("summary", "")
-                    html += f'<h3>{title}</h3>'
-                    if image_url:
-                        html += f'<img src="{image_url}" alt="{title}" style="max-width:200px;"><br>'
-                    html += f'<div>{summary}</div><hr>'
-            return html
-        else:
-            return "No recipes found."
-    else:
-        return f"Error: {response.status_code}"
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    results = None
-    if flask_request.method == 'POST':
-        ingredients = flask_request.form['ingredients']
-        ingredient_list = [i.strip() for i in ingredients.split(',') if i.strip()]
-        results = get_recipes_html(ingredient_list)
-    return render_template_string(HTML_TEMPLATE, results=results)
+# Import routes after app is created
+from routes import *
 
 if __name__ == "__main__":
     import sys
+    
     if len(sys.argv) > 1 and sys.argv[1] == 'web':
+        print(f"🚀 Starting web app with {quota_manager.get_remaining_requests()} API calls remaining")
         app.run(debug=True, host='0.0.0.0', port=8080)
     else:
         run_cli()
